@@ -98,7 +98,7 @@
       fissureEveryN: 7,
       fissureFromStep: 8,
 
-      fissureMaxActiveDraw: 2,
+      fissureMaxActiveDraw: 6,  // 增加渲染预算，让更多图片同时显示
       fissureDistanceActive: 28,
 
       wallHeight: 44,
@@ -599,9 +599,14 @@
         const b = smooth01(clamp((g-0.22)/0.52, 0,1));
         f.reveal = lerp(f.reveal, b, 0.12);
 
-        f.plane.material.opacity = clamp(0.05*a + 0.95*f.reveal, 0, 1);
-        f.rim.material.opacity = 0.06 + 0.22*a;
-        f.backing.material.opacity = 0.10 + 0.18*a;
+        // 添加呼吸效果，让图片若隐若现
+        const breathe = 0.5 + 0.15 * Math.sin(performance.now() * 0.0008 + f.stepI);
+        const baseOpacity = 0.35 * breathe;  // 基础透明度 0.25-0.50
+        const hoverBoost = 0.05*a + 0.60*f.reveal;  // 悬停时增加
+        f.plane.material.opacity = clamp(baseOpacity + hoverBoost, 0, 1);
+
+        f.rim.material.opacity = 0.12 + 0.22*a;  // 边框也提高基础透明度
+        f.backing.material.opacity = 0.15 + 0.18*a;
 
         if(isHover){
           crosshair.style.transform = 'translate(-50%,-50%) scale(1.35)';
@@ -613,11 +618,13 @@
         const moveQuality = clamp(1 - look01, 0, 1);
         const instability = clamp(collapseIntensity/10, 0, 1);
 
-        const blur = lerp(0.0, 8.0, instability) + (1-moveQuality)*6.0;
-        const veil = clamp(lerp(0.28, 0.04, f.reveal) + (1-moveQuality)*0.14, 0, 0.35);
-        const noiseA = lerp(0.02, 0.16, instability) * (0.5 + 0.5*f.reveal);
+        // 调整效果，让基础状态也相对清晰
+        const blur = lerp(0.5, 8.0, instability) + (1-moveQuality)*3.0 - f.reveal*2.5;
+        const veil = clamp(lerp(0.18, 0.02, f.reveal) + (1-moveQuality)*0.10, 0, 0.28);
+        const noiseA = lerp(0.03, 0.16, instability) * (0.4 + 0.6*f.reveal);
 
-        const active = near && (isHover || f.reveal > 0.18);
+        // 让所有附近的裂缝都保持渲染，实现若隐若现效果
+        const active = near;
         if(active && drawBudget > 0){
           f.frameTick++;
           const skip = Math.floor(lerp(1, 5, instability));
