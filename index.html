@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Forward Only</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@700;900&display=swap');
+    html, body { margin:0; padding:0; overflow:hidden; background:#0a0b10; font-family: Inter, system-ui; }
+
+    /* start-only UI */
+    #ui{
+      position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+      background: radial-gradient(1100px 650px at 50% 42%, rgba(255,255,255,.08), rgba(0,0,0,.96));
+      color:#e9ecf1; z-index:10; transition: opacity .5s;
+    }
+    #panel{
+      width:min(520px, 92vw);
+      border:1px solid rgba(255,255,255,.14);
+      border-radius:18px;
+      padding:24px;
+      background: rgba(10,12,18,.58);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 30px 140px rgba(0,0,0,.6);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+    }
+    #start{
+      display:inline-flex; align-items:center; justify-content:center;
+      padding:14px 22px; border-radius:999px; cursor:pointer; user-select:none;
+      background: rgba(233,236,241,.95); color:#0a0b10; font-weight:900; font-size:13px;
+      box-shadow: 0 14px 40px rgba(0,0,0,.45);
+      letter-spacing:.4px;
+    }
+    #start:active{ transform: translateY(1px); }
+
+    #crosshair{
+      position:absolute; top:50%; left:50%;
+      width:10px; height:10px; border-radius:999px;
+      transform: translate(-50%,-50%);
+      border:2px solid rgba(233,236,241,.92);
+      background: rgba(233,236,241,.10);
+      z-index:5; display:none; pointer-events:none;
+      transition: transform .12s, background .12s, border-color .12s, opacity .12s;
+      opacity:.9;
+    }
+    #fade{
+      position:absolute; inset:0; background:#000; opacity:0; pointer-events:none; z-index:20;
+      transition: opacity .25s linear;
+    }
+    /* vignette */
+    #vignette{
+      position:absolute; inset:-2px;
+      pointer-events:none; z-index:18;
+      opacity:0;
+      background: radial-gradient(900px 520px at 50% 50%,
+        rgba(0,0,0,0) 0%,
+        rgba(0,0,0,0.0) 45%,
+        rgba(0,0,0,0.75) 100%);
+      transition: opacity .08s linear;
+      mix-blend-mode: multiply;
+    }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div id="panel">
+      <div id="start">START</div>
+    </div>
+  </div>
+
+  <div id="crosshair"></div>
+  <div id="vignette"></div>
+  <div id="fade"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script>
+    // =========================
+    // TUNING
+    // =========================
+    const SETTINGS = {
+      baseSpeed: 4.4,
+      lookSlowMax: 0.55,
+
+      stepDepth: 1.7,
+      stepHeight: 0.24,
+      eyeHeight: 1.85,
+
+      corridorHalf: 3.35,
+      stairWidthMul: 2.10,
+
+      streamAheadSteps: 220,
+      streamBehindSteps: 90,
+
+      decayBasePerSec: 2.2,
+      decayBoostPerSec: 6.5,
+
+      fissureEveryN: 7,
+      fissureFromStep: 8,
+
+      fissureMaxActiveDraw: 2,
+      fissureDistanceActive: 28,
+
+      wallHeight: 44,
+      ceilingSegLen: 280,
+
+      fallGravity: 24,
+      fadeSpeed: 0.85,
+
+      // body feedback
+      fovBase: 75,
+      fovTight: 62,
+      pulseEvery: 2.6
+    };
+
+    // ===== 20 simple filenames =====
+    // images/memory01.jpg ... images/memory20.jpg
+    const IMAGE_LIST = Array.from({length:20}, (_,i)=> {
+      const n = String(i+1).padStart(2,'0');
+      return `images/memory${n}.jpg`;
+    });
+
+    const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+    const lerp  = (a,b,t)=>a+(b-a)*t;
+    const smooth01 = (t)=> t*t*(3-2*t);
+
+    const ui = document.getElementById('ui');
+    const startBtn = document.getElementById('start');
+    const crosshair = document.getElementById('crosshair');
+    const fade = document.getElementById('fade');
+    const vignette = document.getElementById('vignette');
+
+    let scene, camera, renderer;
+    let isLocked = false;
+
+    const raycaster = new THREE.Raycaster();
+    const ndc = new THREE.Vector2(0,0);
+
+    let tPrev = performance.now();
+
+    // stairs streaming
+    let stepIndex = 0;
+    let createdMaxStep = 0;
+    let createdMinStep = 0;
+    const stepMeshes = new Map();
+
+    // collapse state
+    let decayStep = -10;
+    let collapseIntensity = 0;
+
+    let isFalling = false;
+    let fallVel = 0;
+    let fade01 = 0;
+
+    // fissures
+    const fissures = new Map();
+    let fissurePlanes = [];
+    let hovered = null;
+
+    // materials/textures
+    let concreteTex, wallMat, stepMat;
+
+    // ceiling
+    let ceilSegs = [];
+
+    // pulse
+    let pulseT = 0;
+
+    // reusable noise canvas
+    const NOISE_TEX = (() => {
+      const c = document.createElement('canvas');
+      c.width = 256; c.height = 256;
+      const ctx = c.getContext('2d');
+      const img = ctx.createImageData(256,256);
+      for(let i=0;i<img.data.length;i+=4){
+        const v = (Math.random()*255)|0;
+        img.data[i]=v; img.data[i+1]=v; img.data[i+2]=v; img.data[i+3]=255;
+      }
+      ctx.putImageData(img,0,0);
+      return c;
+    })();
+
+    init();
+    animate();
+
+    function init(){
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0a0b10);
+      scene.fog = new THREE.FogExp2(0x0a0b10, 0.012);
+
+      camera = new THREE.PerspectiveCamera(SETTINGS.fovBase, innerWidth/innerHeight, 0.1, 4000);
+      camera.position.set(0, SETTINGS.eyeHeight, 6);
+      camera.rotation.order = 'YXZ';
+      scene.add(camera);
+
+      // lights
+      scene.add(new THREE.AmbientLight(0xffffff, 0.22));
+      const key = new THREE.DirectionalLight(0xffffff, 0.90);
+      key.position.set(6, 18, 10);
+      scene.add(key);
+
+      // textures
+      concreteTex = makeConcreteTexture();
+      concreteTex.wrapS = concreteTex.wrapT = THREE.RepeatWrapping;
+      concreteTex.repeat.set(4,4);
+
+      wallMat = new THREE.MeshStandardMaterial({
+        color: 0xd9dde6, roughness: 0.92, metalness: 0.0, map: concreteTex
+      });
+      stepMat = new THREE.MeshStandardMaterial({
+        color: 0xf0f2f6, roughness: 0.78, metalness: 0.0, map: concreteTex
+      });
+
+      // corridor walls
+      const WALL_LEN = 1400;
+      const wallGeo = new THREE.BoxGeometry(0.25, SETTINGS.wallHeight, WALL_LEN);
+      const wallY = SETTINGS.wallHeight * 0.5;
+      const leftWall  = new THREE.Mesh(wallGeo, wallMat);
+      const rightWall = new THREE.Mesh(wallGeo, wallMat);
+      leftWall.position.set(-SETTINGS.corridorHalf, wallY, -WALL_LEN*0.5);
+      rightWall.position.set( SETTINGS.corridorHalf, wallY, -WALL_LEN*0.5);
+      scene.add(leftWall, rightWall);
+
+      makeCeiling();
+
+      // initial streaming
+      createdMaxStep = 0;
+      createdMinStep = 0;
+      streamEnsure();
+
+      // renderer
+      renderer = new THREE.WebGLRenderer({ antialias:true });
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.outputEncoding = THREE.sRGBEncoding;
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 1.25));
+      document.body.appendChild(renderer.domElement);
+
+      // pointer lock
+      startBtn.addEventListener('click', ()=> document.body.requestPointerLock());
+
+      document.addEventListener('pointerlockchange', ()=>{
+        isLocked = (document.pointerLockElement === document.body);
+        if(isLocked){
+          ui.style.opacity = 0;
+          setTimeout(()=> ui.style.display='none', 420);
+          crosshair.style.display = 'block';
+        }else{
+          ui.style.display = 'flex';
+          setTimeout(()=> ui.style.opacity = 1, 10);
+          crosshair.style.display = 'none';
+        }
+      });
+
+      document.addEventListener('mousemove', (e)=>{
+        if(!isLocked) return;
+        camera.rotation.y -= e.movementX * 0.0010;
+        camera.rotation.x -= e.movementY * 0.0010;
+        camera.rotation.x = clamp(camera.rotation.x, -Math.PI/2, Math.PI/2);
+      });
+
+      window.addEventListener('resize', ()=>{
+        camera.aspect = innerWidth/innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+    }
+
+    // ===== Streaming =====
+    function streamEnsure(){
+      const camStep = Math.max(0, Math.floor(stepIndex));
+      const needMax = camStep + SETTINGS.streamAheadSteps;
+      const keepMin = camStep - SETTINGS.streamBehindSteps;
+
+      for(let i = createdMaxStep; i <= needMax; i++){
+        if(!stepMeshes.has(i)){
+          const m = makeStepMesh(i);
+          stepMeshes.set(i, m);
+          scene.add(m);
+        }
+        maybeCreateFissure(i);
+        createdMaxStep = i + 1;
+      }
+
+      for(let i = createdMinStep; i < keepMin; i++){
+        const m = stepMeshes.get(i);
+        if(m){
+          scene.remove(m);
+          stepMeshes.delete(i);
+        }
+        const f = fissures.get(i);
+        if(f){
+          destroyFissure(i, f);
+        }
+        createdMinStep = i + 1;
+      }
+
+      applyDecayRemoval();
+      rebuildFissureRaycastList();
+    }
+
+    function makeStepMesh(i){
+      const geo = new THREE.BoxGeometry(SETTINGS.corridorHalf*SETTINGS.stairWidthMul, 0.22, SETTINGS.stepDepth);
+      const m = new THREE.Mesh(geo, stepMat);
+      const y = i * SETTINGS.stepHeight;
+      const z = -i * SETTINGS.stepDepth;
+      m.position.set(0, y, z);
+
+      const edgeGeo = new THREE.BoxGeometry(SETTINGS.corridorHalf*SETTINGS.stairWidthMul*0.98, 0.02, 0.05);
+      const edge = new THREE.Mesh(edgeGeo, new THREE.MeshBasicMaterial({ color: 0x0a0b10 }));
+      edge.position.set(0, 0.12, -SETTINGS.stepDepth*0.5 + 0.06);
+      m.add(edge);
+      return m;
+    }
+
+    // ===== Decay removal =====
+    function applyDecayRemoval(){
+      const d = Math.floor(decayStep);
+      if(d < 0) return;
+
+      for(let i = createdMinStep; i <= d; i++){
+        const m = stepMeshes.get(i);
+        if(m){
+          scene.remove(m);
+          stepMeshes.delete(i);
+        }
+        const f = fissures.get(i);
+        if(f){
+          destroyFissure(i, f);
+        }
+      }
+    }
+
+    // ===== Fissures =====
+    function maybeCreateFissure(i){
+      if(i < SETTINGS.fissureFromStep) return;
+      if(i % SETTINGS.fissureEveryN !== 0) return;
+      if(fissures.has(i)) return;
+
+      const k = Math.floor(i / SETTINGS.fissureEveryN);
+      const side = (k % 2 === 0) ? 1 : -1;
+      const imgUrl = IMAGE_LIST[k % IMAGE_LIST.length];
+
+      const f = createFissure(i, side, imgUrl);
+      fissures.set(i, f);
+      scene.add(f.group);
+    }
+
+    function rebuildFissureRaycastList(){
+      fissurePlanes = [];
+      fissures.forEach(f => fissurePlanes.push(f.plane));
+    }
+
+    function destroyFissure(i, f){
+      scene.remove(f.group);
+      fissures.delete(i);
+    }
+
+    function createFissure(stepI, side, imgUrl){
+      const group = new THREE.Group();
+
+      const z = -stepI * SETTINGS.stepDepth;
+
+      // lowered & a bit earlier
+      const y = stepI * SETTINGS.stepHeight + 3.4;
+      const x = side * (SETTINGS.corridorHalf - 0.18);
+
+      group.position.set(x, y, z);
+      group.rotation.y = side === 1 ? -Math.PI/2 : Math.PI/2;
+      group.rotation.z = (side === 1 ? 1 : -1) * 0.10;
+
+      const canvas = document.createElement('canvas');
+      canvas.width = 640; canvas.height = 360;
+      const ctx = canvas.getContext('2d');
+
+      const mask = makeFissureMask(canvas.width, canvas.height, stepI);
+
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.encoding = THREE.sRGBEncoding;
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+
+      const w = 3.15, h = 1.95;
+
+      const backing = new THREE.Mesh(
+        new THREE.PlaneGeometry(w+0.20, h+0.20),
+        new THREE.MeshStandardMaterial({
+          color: 0xbfc7d6, roughness: 0.98, metalness: 0.0,
+          transparent:true, opacity: 0.10
+        })
+      );
+      backing.position.z = -0.06;
+
+      const rim = new THREE.Mesh(
+        new THREE.PlaneGeometry(w+0.05, h+0.05),
+        new THREE.MeshBasicMaterial({ color:0x0a0b10, transparent:true, opacity:0.10 })
+      );
+      rim.position.z = -0.03;
+
+      const plane = new THREE.Mesh(
+        new THREE.PlaneGeometry(w, h),
+        new THREE.MeshBasicMaterial({ map: tex, transparent:true, opacity: 0.0, depthWrite:false })
+      );
+
+      group.add(backing, rim, plane);
+
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.src = imgUrl;
+
+      const state = {
+        stepI, side, group, plane, rim, backing,
+        img, imgUrl, canvas, ctx, tex, mask,
+        gaze: 0, reveal: 0,
+        ready: false,
+        frameTick: 0,
+        jitterSeed: stepI * 13.7
+      };
+
+      img.onload = ()=> { state.ready = true; };
+      img.onerror = ()=> { state.ready = false; };
+
+      drawPlaceholder(state);
+      plane.__fissRef = state;
+      return state;
+    }
+
+    function makeFissureMask(w,h,seed){
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d');
+
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0,0,w,h);
+
+      const cx = w*0.50 + (seed%7-3)*6;
+      const cy = h*0.50 + (seed%9-4)*4;
+      const rx = w*0.34;
+      const ry = h*0.40;
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.beginPath();
+
+      const points = 28;
+      for(let i=0;i<=points;i++){
+        const t = (i/points) * Math.PI*2;
+        const jitter = 0.22 + 0.18*Math.sin(t*3 + seed*0.13) + (Math.random()*0.12);
+        const x = Math.cos(t) * rx * jitter;
+        const y = Math.sin(t) * ry * jitter;
+        if(i===0) ctx.moveTo(x,y);
+        else ctx.lineTo(x,y);
+      }
+      ctx.closePath();
+
+      const grad = ctx.createRadialGradient(0,0,Math.min(rx,ry)*0.25, 0,0, Math.max(rx,ry)*0.65);
+      grad.addColorStop(0.0,'rgba(255,255,255,1)');
+      grad.addColorStop(0.72,'rgba(255,255,255,1)');
+      grad.addColorStop(1.0,'rgba(255,255,255,0)');
+      ctx.fillStyle = grad;
+      ctx.fill();
+      ctx.restore();
+
+      ctx.globalAlpha = 0.65;
+      ctx.strokeStyle = 'rgba(255,255,255,0.65)';
+      ctx.lineWidth = 2;
+      for(let k=0;k<5;k++){
+        ctx.beginPath();
+        const x0 = w*(0.25 + Math.random()*0.5);
+        const y0 = h*(0.2 + Math.random()*0.6);
+        ctx.moveTo(x0,y0);
+        for(let s=0;s<6;s++){
+          const nx = x0 + (Math.random()-0.5)*w*0.22;
+          const ny = y0 + (Math.random()-0.5)*h*0.22;
+          ctx.lineTo(nx,ny);
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+
+      return c;
+    }
+
+    function drawPlaceholder(f){
+      const { ctx, canvas, mask } = f;
+      const w = canvas.width, h = canvas.height;
+      ctx.clearRect(0,0,w,h);
+
+      ctx.fillStyle = 'rgba(14,16,22,1)';
+      ctx.fillRect(0,0,w,h);
+
+      for(let i=0;i<120;i++){
+        const yy = (i*6 + (performance.now()*0.03)) % h;
+        ctx.fillStyle = `rgba(215,225,245,${0.02 + Math.random()*0.03})`;
+        ctx.fillRect(0,yy,w,2);
+      }
+
+      ctx.globalCompositeOperation = 'destination-in';
+      ctx.drawImage(mask,0,0,w,h);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    function drawFissureFrame(f, blurPx, veil, noiseA){
+      const { ctx, canvas, img, mask } = f;
+      const w = canvas.width, h = canvas.height;
+
+      ctx.clearRect(0,0,w,h);
+      ctx.fillStyle = 'rgba(10,12,18,1)';
+      ctx.fillRect(0,0,w,h);
+
+      if(f.ready){
+        // draw image "cover" style
+        const iw = img.naturalWidth || img.width;
+        const ih = img.naturalHeight || img.height;
+        const s = Math.max(w/iw, h/ih);
+        const dw = iw*s, dh = ih*s;
+        const dx = (w - dw)*0.5;
+        const dy = (h - dh)*0.5;
+
+        ctx.save();
+        ctx.filter = `blur(${blurPx}px)`;
+        ctx.globalAlpha = 1.0;
+        ctx.drawImage(img, dx, dy, dw, dh);
+        ctx.restore();
+      } else {
+        drawPlaceholder(f);
+      }
+
+      if(veil > 0){
+        ctx.fillStyle = `rgba(235,240,250,${veil})`;
+        ctx.fillRect(0,0,w,h);
+      }
+
+      if(noiseA > 0){
+        ctx.save();
+        ctx.globalAlpha = noiseA;
+        ctx.drawImage(NOISE_TEX, 0,0,w,h);
+        ctx.restore();
+      }
+
+      // subtle flicker to feel unstable
+      const flick = 0.015 + 0.03*Math.sin(performance.now()*0.006 + f.jitterSeed);
+      ctx.fillStyle = `rgba(10,12,18,${flick})`;
+      ctx.fillRect(0,0,w,h);
+
+      ctx.globalCompositeOperation = 'destination-in';
+      ctx.drawImage(mask,0,0,w,h);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    // ===== Ceiling =====
+    function makeCeiling(){
+      const CEIL_Y = SETTINGS.wallHeight - 0.1;
+      const geo = new THREE.BoxGeometry(SETTINGS.corridorHalf*2.25, 0.18, SETTINGS.ceilingSegLen);
+      const mat = new THREE.MeshStandardMaterial({
+        color:0xcfd5e3, roughness:0.95, metalness:0.0, map: concreteTex
+      });
+      ceilSegs = [];
+      for(let i=0;i<3;i++){
+        const seg = new THREE.Mesh(geo, mat);
+        seg.position.set(0, CEIL_Y, -i*SETTINGS.ceilingSegLen);
+        scene.add(seg);
+        ceilSegs.push(seg);
+      }
+    }
+
+    function updateCeiling(){
+      const segLen = SETTINGS.ceilingSegLen;
+      const base = Math.floor((-camera.position.z) / segLen) * segLen;
+      for(let i=0;i<ceilSegs.length;i++){
+        ceilSegs[i].position.z = -(base + i*segLen) - segLen*0.5;
+      }
+    }
+
+    // ===== Fissure update =====
+    function updateFissures(dt){
+      hovered = null;
+      if(isLocked && fissurePlanes.length){
+        raycaster.setFromCamera(ndc, camera);
+        const hits = raycaster.intersectObjects(fissurePlanes, false);
+        if(hits.length) hovered = hits[0].object.__fissRef;
+      }
+
+      let drawBudget = SETTINGS.fissureMaxActiveDraw;
+      let look01 = 0;
+      let anyHover = false;
+
+      fissures.forEach(f=>{
+        const dz = Math.abs(f.group.position.z - camera.position.z);
+        const near = dz < SETTINGS.fissureDistanceActive;
+
+        const isHover = (hovered === f);
+        if(isHover){ anyHover = true; look01 = Math.max(look01, f.gaze); }
+
+        const gv = isHover ? 1.15 : -1.6;
+        f.gaze = clamp(f.gaze + gv*dt, 0, 1);
+
+        const g = f.gaze;
+        const a = smooth01(clamp(g/0.22, 0,1));
+        const b = smooth01(clamp((g-0.22)/0.52, 0,1));
+        f.reveal = lerp(f.reveal, b, 0.12);
+
+        f.plane.material.opacity = clamp(0.05*a + 0.95*f.reveal, 0, 1);
+        f.rim.material.opacity = 0.06 + 0.22*a;
+        f.backing.material.opacity = 0.10 + 0.18*a;
+
+        if(isHover){
+          crosshair.style.transform = 'translate(-50%,-50%) scale(1.35)';
+          crosshair.style.background = 'rgba(255,255,255,0.16)';
+          crosshair.style.borderColor = 'rgba(255,255,255,0.95)';
+        }
+
+        // quality depends on pressure + gaze
+        const moveQuality = clamp(1 - look01, 0, 1);
+        const instability = clamp(collapseIntensity/10, 0, 1);
+
+        const blur = lerp(0.0, 8.0, instability) + (1-moveQuality)*6.0;
+        const veil = clamp(lerp(0.28, 0.04, f.reveal) + (1-moveQuality)*0.14, 0, 0.35);
+        const noiseA = lerp(0.02, 0.16, instability) * (0.5 + 0.5*f.reveal);
+
+        const active = near && (isHover || f.reveal > 0.18);
+        if(active && drawBudget > 0){
+          f.frameTick++;
+          const skip = Math.floor(lerp(1, 5, instability));
+          if(f.frameTick % skip === 0){
+            drawFissureFrame(f, blur, veil, noiseA);
+            f.tex.needsUpdate = true;
+          }
+          drawBudget--;
+        }
+
+        f.group.position.y += Math.sin(performance.now()*0.001 + f.stepI) * 0.00035;
+      });
+
+      if(!anyHover){
+        crosshair.style.transform = 'translate(-50%,-50%) scale(1.0)';
+        crosshair.style.background = 'rgba(233,236,241,0.10)';
+        crosshair.style.borderColor = 'rgba(233,236,241,0.92)';
+      }
+
+      return clamp(look01, 0, 1);
+    }
+
+    // ===== Loop =====
+    function animate(){
+      requestAnimationFrame(animate);
+
+      const now = performance.now();
+      let dt = (now - tPrev) / 1000;
+      tPrev = now;
+      dt = Math.min(dt, 0.08);
+
+      if(isLocked){
+        const look01 = updateFissures(dt);
+
+        // body feedback
+        pulseT += dt;
+        const pressure = clamp(collapseIntensity / 12, 0, 1);
+        const p = (pulseT % SETTINGS.pulseEvery) / SETTINGS.pulseEvery;
+        const pulse = Math.pow(Math.sin(p * Math.PI), 2.6) * (0.25 + 0.75 * pressure);
+        const gazeStress = clamp(look01, 0, 1);
+
+        if(vignette){
+          const v = clamp(pressure * 0.65 + pulse * 0.55 + gazeStress * 0.35, 0, 0.95);
+          vignette.style.opacity = v.toFixed(3);
+        }
+
+        const targetFov = lerp(
+          SETTINGS.fovBase,
+          SETTINGS.fovTight,
+          clamp(pressure * 0.75 + pulse * 0.55 + gazeStress * 0.45, 0, 1)
+        );
+        camera.fov = lerp(camera.fov, targetFov, 0.10);
+        camera.updateProjectionMatrix();
+
+        // speed penalty when looking
+        const slow = lerp(0, SETTINGS.lookSlowMax, look01);
+        const speed = SETTINGS.baseSpeed * (1 - slow);
+
+        collapseIntensity += dt * (0.18 + look01*0.85);
+
+        // collapse behind faster when looking
+        const decayRate = SETTINGS.decayBasePerSec + look01 * SETTINGS.decayBoostPerSec;
+        decayStep += decayRate * dt;
+
+        if(!isFalling){
+          camera.position.z -= speed * dt;
+
+          stepIndex = Math.max(0, (-camera.position.z) / SETTINGS.stepDepth);
+          const stairY = stepIndex * SETTINGS.stepHeight + SETTINGS.eyeHeight;
+
+          const under = Math.floor(stepIndex);
+          const minSafeStep = Math.floor(decayStep) + 1;
+          const hasStep = stepMeshes.has(under) && (under >= minSafeStep);
+
+          if(hasStep){
+            camera.position.y = lerp(camera.position.y, stairY, 0.22);
+          }else{
+            isFalling = true;
+            fallVel = 0;
+          }
+        }
+
+        if(isFalling){
+          fallVel += SETTINGS.fallGravity * dt;
+          camera.position.y -= fallVel * dt;
+          fade01 = clamp(fade01 + SETTINGS.fadeSpeed*dt, 0, 1);
+          fade.style.opacity = fade01.toFixed(3);
+        }else{
+          scene.fog.density = lerp(0.012, 0.034, clamp(collapseIntensity/12, 0, 1));
+          fade01 = clamp(fade01 - dt*0.9, 0, 1);
+          fade.style.opacity = fade01.toFixed(3);
+        }
+
+        streamEnsure();
+        updateCeiling();
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    function makeConcreteTexture(){
+      const c = document.createElement('canvas');
+      c.width = 256; c.height = 256;
+      const ctx = c.getContext('2d');
+
+      ctx.fillStyle = '#f2f4f8';
+      ctx.fillRect(0,0,256,256);
+
+      for(let i=0;i<9000;i++){
+        const a = Math.random()*0.08;
+        ctx.fillStyle = `rgba(0,0,0,${a})`;
+        ctx.fillRect(Math.random()*256, Math.random()*256, 2, 2);
+      }
+      for(let i=0;i<5000;i++){
+        const a = Math.random()*0.05;
+        ctx.fillStyle = `rgba(255,255,255,${a})`;
+        ctx.fillRect(Math.random()*256, Math.random()*256, 2, 2);
+      }
+
+      return new THREE.CanvasTexture(c);
+    }
+  </script>
+</body>
+</html>
