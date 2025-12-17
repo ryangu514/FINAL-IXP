@@ -132,7 +132,7 @@
 
     let scene, camera, renderer;
     let isLocked = false;
-    let isShiftPressed = false;  // 追踪Shift键状态
+    let isWPressed = false;  // 追踪W键状态
 
     const raycaster = new THREE.Raycaster();
     const ndc = new THREE.Vector2(0,0);
@@ -259,13 +259,13 @@
         camera.rotation.x = clamp(camera.rotation.x, -Math.PI/2, Math.PI/2);
       });
 
-      // 键盘事件：Shift键加速
+      // 键盘事件：W键加速
       document.addEventListener('keydown', (e)=>{
-        if(e.key === 'Shift') isShiftPressed = true;
+        if(e.key === 'w' || e.key === 'W') isWPressed = true;
       });
 
       document.addEventListener('keyup', (e)=>{
-        if(e.key === 'Shift') isShiftPressed = false;
+        if(e.key === 'w' || e.key === 'W') isWPressed = false;
       });
 
       window.addEventListener('resize', ()=>{
@@ -677,13 +677,13 @@
         const gazeStress = clamp(look01, 0, 1);
 
         if(vignette){
-          const sprintVignette = isShiftPressed ? 0.25 : 0;  // 加速时增加晕影
+          const sprintVignette = isWPressed ? 0.15 : 0;  // 加速时增加晕影（降低效果）
           const v = clamp(pressure * 0.65 + pulse * 0.55 + gazeStress * 0.35 + sprintVignette, 0, 0.95);
           vignette.style.opacity = v.toFixed(3);
         }
 
         // 加速时视野更宽，营造速度感
-        const sprintFovBoost = isShiftPressed ? 15 : 0;
+        const sprintFovBoost = isWPressed ? 8 : 0;  // 降低FOV变化
         const baseFov = SETTINGS.fovBase + sprintFovBoost;
         const targetFov = lerp(
           baseFov,
@@ -695,15 +695,15 @@
 
         // speed penalty when looking
         const slow = lerp(0, SETTINGS.lookSlowMax, look01);
-        const speedMultiplier = isShiftPressed ? 2.5 : 1.0;  // Shift键加速2.5倍
+        const speedMultiplier = isWPressed ? 1.5 : 1.0;  // W键加速1.5倍
         const speed = SETTINGS.baseSpeed * (1 - slow) * speedMultiplier;
 
-        // 加速时压力也增加
-        const speedBonus = isShiftPressed ? 0.5 : 0;
+        // 加速时压力也增加（降低效果）
+        const speedBonus = isWPressed ? 0.3 : 0;
         collapseIntensity += dt * (0.18 + look01*0.85 + speedBonus);
 
-        // collapse behind faster when looking or sprinting
-        const sprintBoost = isShiftPressed ? 2.0 : 0;  // 加速时楼梯崩塌更快
+        // collapse behind faster when looking or sprinting（降低崩塌速度）
+        const sprintBoost = isWPressed ? 1.0 : 0;  // 加速时楼梯崩塌更快
         const decayRate = SETTINGS.decayBasePerSec + look01 * SETTINGS.decayBoostPerSec + sprintBoost;
         decayStep += decayRate * dt;
 
